@@ -1,0 +1,278 @@
+#!/usr/bin/env python3
+"""
+mega-tail - Follow dynamic log files under a directory tree.
+
+Behavior:
+- Follows appended lines from all matching log files under the target directory.
+- Detects and starts following newly created log files as they appear.
+- Handles truncation/rotation by checking inode and file size changes.
+- Prefixes each line with relative file path and detection timestamp.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fnmatch
+import os
+import signal
+import sys
+import time
+from collections import deque
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+
+DEFAULT_GLOBS = ("*.log", "*.log.*")
+DEFAULT_POLL_INTERVAL = 0.2
+DEFAULT_SCAN_INTERVAL = 1.0
+
+# ANSI colors
+C_RESET = "\033[0m"
+C_TIMESTAMP = "\033[38;5;81m"   # highlighted cyan
+C_FILE = "\033[38;5;245m"       # dim gray
+C_CONTENT = "\033[38;5;252m"    # brighter gray
+C_INFO = "\033[38;5;244m"
+
+
+@dataclass
+class FileState:
+    position: int
+    inode: int | None
+    partial: str = ""
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="mega-tail",
+        description="Tail dynamic log files in a directory tree.",
+    )
+    parser.add_argument("directory", help="Root directory to monitor recursively")
+    parser.add_argument(
+        "--glob",
+        dest="globs",
+        action="append",
+        help="Filename glob to include (repeatable). Default: *.log and *.log.*",
+    )
+    parser.add_argument(
+        "--poll-interval",
+        type=float,
+        default=DEFAULT_POLL_INTERVAL,
+        help=f"Seconds between reads of tracked files (default: {DEFAULT_POLL_INTERVAL})",
+    )
+    parser.add_argument(
+        "--scan-interval",
+        type=float,
+        default=DEFAULT_SCAN_INTERVAL,
+        help=f"Seconds between directory scans for new/deleted files (default: {DEFAULT_SCAN_INTERVAL})",
+    )
+    parser.add_argument(
+        "-n",
+        "--initial-lines",
+        type=int,
+        default=0,
+        help="Show last N lines from each existing file at startup (default: 0)",
+    )
+    parser.add_argument(
+        "--color",
+        choices=("auto", "always", "never"),
+        default="auto",
+        help="Color mode (default: auto)",
+    )
+    return parser.parse_args()
+
+
+def color_enabled(mode: str) -> bool:
+    if mode == "always":
+        return True
+    if mode == "never":
+        return False
+    return sys.stdout.isatty() and os.environ.get("TERM", "") != "dumb"
+
+
+def paint(text: str, color: str, enabled: bool) -> str:
+    if not enabled:
+        return text
+    return f"{color}{text}{C_RESET}"
+
+
+def detection_timestamp() -> str:
+    now = datetime.now().astimezone()
+    return now.strftime("%Y-%m-%d %H:%M:%S.") + f"{now.microsecond // 1000:03d}"
+
+
+def discover_log_files(root: Path, globs: list[str]) -> set[Path]:
+    lowered_globs = [g.lower() for g in globs]
+    matches: set[Path] = set()
+    for dirpath, _, filenames in os.walk(root):
+        base = Path(dirpath)
+        for filename in filenames:
+            name = filename.lower()
+            if any(fnmatch.fnmatch(name, pattern) for pattern in lowered_globs):
+                matches.add(base / filename)
+    return matches
+
+
+def read_last_lines(path: Path, count: int) -> list[str]:
+    if count <= 0:
+        return []
+    lines = deque(maxlen=count)
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                lines.append(line.rstrip("\r\n"))
+    except OSError:
+        return []
+    return list(lines)
+
+
+def relative_display(root: Path, path: Path) -> str:
+    try:
+        return path.relative_to(root).as_posix()
+    except ValueError:
+        return str(path)
+
+
+def format_output(relpath: str, line: str, use_color: bool) -> str:
+    file_block = paint(f"[{relpath}]", C_FILE, use_color)
+    ts_block = paint(f"[{detection_timestamp()}]", C_TIMESTAMP, use_color)
+    content = paint(line, C_CONTENT, use_color)
+    return f"{file_block} {ts_block} {content}"
+
+
+def drain_new_lines(path: Path, state: FileState) -> list[str]:
+    try:
+        stat = path.stat()
+    except OSError:
+        return []
+
+    inode = stat.st_ino
+    size = stat.st_size
+
+    if state.inode is None:
+        state.inode = inode
+
+    rotated = state.inode != inode
+    truncated = size < state.position
+    if rotated or truncated:
+        state.inode = inode
+        state.position = 0
+        state.partial = ""
+
+    if size <= state.position:
+        return []
+
+    try:
+        with path.open("rb") as handle:
+            handle.seek(state.position)
+            payload = handle.read()
+            state.position = handle.tell()
+    except OSError:
+        return []
+
+    if not payload:
+        return []
+
+    # Preserve a trailing partial line and emit only complete lines.
+    chunk = state.partial + payload.decode("utf-8", errors="replace")
+    parts = chunk.splitlines(keepends=True)
+    lines: list[str] = []
+    state.partial = ""
+
+    for part in parts:
+        if part.endswith("\n") or part.endswith("\r"):
+            lines.append(part.rstrip("\r\n"))
+        else:
+            state.partial = part
+
+    return lines
+
+
+def install_signal_handlers() -> None:
+    def _stop(_signum, _frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGINT, _stop)
+    signal.signal(signal.SIGTERM, _stop)
+
+
+def main() -> int:
+    args = parse_args()
+
+    root = Path(args.directory).expanduser().resolve()
+    if not root.is_dir():
+        print(f"Error: not a directory: {root}", file=sys.stderr)
+        return 1
+
+    if args.poll_interval <= 0 or args.scan_interval <= 0:
+        print("Error: poll and scan intervals must be positive", file=sys.stderr)
+        return 1
+
+    if args.initial_lines < 0:
+        print("Error: --initial-lines must be >= 0", file=sys.stderr)
+        return 1
+
+    use_color = color_enabled(args.color)
+    globs = args.globs if args.globs else list(DEFAULT_GLOBS)
+    tracked: dict[Path, FileState] = {}
+
+    existing_files = discover_log_files(root, globs)
+    for path in sorted(existing_files):
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        tracked[path] = FileState(position=stat.st_size, inode=stat.st_ino)
+        if args.initial_lines > 0:
+            rel = relative_display(root, path)
+            for line in read_last_lines(path, args.initial_lines):
+                print(format_output(rel, line, use_color), flush=True)
+
+    info = (
+        f"Monitoring {len(tracked)} files under {root} "
+        f"(globs: {', '.join(globs)} | poll={args.poll_interval}s | scan={args.scan_interval}s). "
+        "Press Ctrl+C to stop."
+    )
+    print(paint(info, C_INFO, use_color), flush=True)
+
+    install_signal_handlers()
+    last_scan = time.monotonic()
+
+    try:
+        while True:
+            now = time.monotonic()
+            if now - last_scan >= args.scan_interval:
+                current_files = discover_log_files(root, globs)
+                tracked_files = set(tracked.keys())
+
+                for new_path in sorted(current_files - tracked_files):
+                    try:
+                        stat = new_path.stat()
+                    except OSError:
+                        continue
+                    # Start new files at byte 0 so early writes are not missed.
+                    tracked[new_path] = FileState(position=0, inode=stat.st_ino)
+                    rel = relative_display(root, new_path)
+                    watch_msg = f"[watch] {rel}"
+                    print(paint(watch_msg, C_INFO, use_color), flush=True)
+
+                for removed_path in tracked_files - current_files:
+                    tracked.pop(removed_path, None)
+
+                last_scan = now
+
+            for path in sorted(tracked.keys()):
+                lines = drain_new_lines(path, tracked[path])
+                if not lines:
+                    continue
+                rel = relative_display(root, path)
+                for line in lines:
+                    print(format_output(rel, line, use_color), flush=True)
+
+            time.sleep(args.poll_interval)
+    except KeyboardInterrupt:
+        print(paint("Stopping mega-tail.", C_INFO, use_color), flush=True)
+        return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
