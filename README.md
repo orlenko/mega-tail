@@ -14,14 +14,30 @@ Tail dynamic logs in a directory tree.
 
 ## Usage
 
+Run via `npx` (no prior install needed):
+
+```bash
+npx mega-tail /var/log/myapp
+```
+
+Run local Python script:
+
 ```bash
 ./mega-tail <directory>
 ```
 
-Example:
+Run local Node script:
+
+```bash
+node bin/mega-tail.js <directory>
+```
+
+Examples:
 
 ```bash
 ./mega-tail /var/log/myapp
+node bin/mega-tail.js /var/log/myapp
+npx mega-tail /var/log/myapp
 ```
 
 Sample output:
@@ -34,7 +50,7 @@ Sample output:
 ## Options
 
 ```bash
-./mega-tail --help
+npx mega-tail --help
 ```
 
 Key options:
@@ -44,3 +60,12 @@ Key options:
 - `--scan-interval <seconds>`: New-file scan interval
 - `-n, --initial-lines <N>`: Show last N lines on startup
 - `--color auto|always|never`: Color mode
+
+## Publishing to npm
+
+```bash
+npm login
+npm whoami
+npm version patch
+npm publish --access public
+```

@@ -1,0 +1,27 @@
+{
+  "name": "mega-tail",
+  "version": "0.1.0",
+  "description": "Tail dynamic log files in a directory tree.",
+  "license": "MIT",
+  "bin": {
+    "mega-tail": "bin/mega-tail.js"
+  },
+  "files": [
+    "bin/mega-tail.js",
+    "README.md",
+    "mega-tail"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "tail",
+    "logs",
+    "cli",
+    "monitoring"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/orlenko/mega-tail.git"
+  }
+}
