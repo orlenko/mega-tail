@@ -69,3 +69,19 @@ npm whoami
 npm version patch
 npm publish --access public
 ```
+
+## Automated npm Publish (GitHub Actions)
+
+One-time setup:
+
+1. Create an npm automation token (publish scope) in npm settings.
+2. Add it to this repo as secret `NPM_TOKEN`.
+
+Release flow:
+
+```bash
+npm version patch
+git push origin main --follow-tags
+```
+
+Pushing a `v*` tag (for example `v0.1.1`) triggers `.github/workflows/publish.yml` and publishes that version to npm.
