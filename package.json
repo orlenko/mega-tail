@@ -1,6 +1,6 @@
 {
   "name": "mega-tail",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Tail dynamic log files in a directory tree.",
   "license": "MIT",
   "bin": {
