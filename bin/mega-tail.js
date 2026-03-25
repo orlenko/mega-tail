@@ -4,11 +4,10 @@
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
-const { performance } = require("node:perf_hooks");
 
 const DEFAULT_GLOBS = ["*.log", "*.log.*"];
-const DEFAULT_POLL_INTERVAL = 0.2;
-const DEFAULT_SCAN_INTERVAL = 1.0;
+const DEFAULT_POLL_INTERVAL = 5.0;
+const DEFAULT_SCAN_INTERVAL = 30.0;
 
 const C_RESET = "\u001b[0m";
 const C_TIMESTAMP = "\u001b[38;5;81m";
@@ -25,8 +24,8 @@ function usage() {
     "",
     "Options:",
     "  --glob <pattern>           Add include glob (repeatable).",
-    `  --poll-interval <seconds>  Read loop interval (default: ${DEFAULT_POLL_INTERVAL}).`,
-    `  --scan-interval <seconds>  New-file scan interval (default: ${DEFAULT_SCAN_INTERVAL}).`,
+    `  --poll-interval <seconds>  Fallback poll interval (default: ${DEFAULT_POLL_INTERVAL}).`,
+    `  --scan-interval <seconds>  Fallback full-scan interval (default: ${DEFAULT_SCAN_INTERVAL}).`,
     "  -n, --initial-lines <N>    Show last N lines on startup (default: 0).",
     "  --color auto|always|never  Color mode (default: auto).",
     "  -h, --help                 Show help.",
@@ -208,7 +207,12 @@ function globToRegex(glob) {
   return new RegExp(out);
 }
 
-function discoverLogFiles(root, globRegexes) {
+function matchesGlob(fileName, globRegexes) {
+  const lower = fileName.toLowerCase();
+  return globRegexes.some((regex) => regex.test(lower));
+}
+
+function discoverLogFilesSync(root, globRegexes) {
   const matches = new Set();
   const stack = [root];
 
@@ -231,14 +235,52 @@ function discoverLogFiles(root, globRegexes) {
         continue;
       }
 
-      const lower = entry.name.toLowerCase();
-      if (globRegexes.some((regex) => regex.test(lower))) {
+      if (matchesGlob(entry.name, globRegexes)) {
         matches.add(full);
       }
     }
   }
 
   return matches;
+}
+
+// Async directory walk that yields to the event loop every BATCH_SIZE
+// directories, so watchers and signals remain responsive during startup.
+async function discoverLogFilesAsync(root, globRegexes, onFound) {
+  const BATCH_SIZE = 50;
+  const stack = [root];
+  let processed = 0;
+
+  while (stack.length > 0) {
+    const current = stack.pop();
+    let entries;
+    try {
+      entries = fs.readdirSync(current, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+
+    for (const entry of entries) {
+      const full = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        stack.push(full);
+        continue;
+      }
+      if (!entry.isFile()) {
+        continue;
+      }
+
+      if (matchesGlob(entry.name, globRegexes)) {
+        onFound(full);
+      }
+    }
+
+    processed += 1;
+    if (processed % BATCH_SIZE === 0) {
+      // Yield to event loop so watchers and signals can fire
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+  }
 }
 
 function readLastLines(filePath, count) {
@@ -349,8 +391,15 @@ function expandHome(inputPath) {
   return inputPath;
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function emitLines(filePath, state, root, useColor) {
+  const lines = drainNewLines(filePath, state);
+  if (lines.length === 0) {
+    return;
+  }
+  const rel = relativeDisplay(root, filePath);
+  for (const line of lines) {
+    process.stdout.write(`${formatOutput(rel, line, useColor)}\n`);
+  }
 }
 
 async function main() {
@@ -393,22 +442,144 @@ async function main() {
   const useColor = colorEnabled(args.color);
   const globs = args.globs.length > 0 ? args.globs : DEFAULT_GLOBS;
   const globRegexes = globs.map((glob) => globToRegex(glob.toLowerCase()));
-  const tracked = new Map();
 
-  const existingFiles = Array.from(discoverLogFiles(root, globRegexes)).sort();
-  for (const filePath of existingFiles) {
+  // tracked: filePath -> { position, inode, partial }
+  const tracked = new Map();
+  // dirWatchers: dirPath -> FSWatcher (one per directory containing log files)
+  const dirWatchers = new Map();
+
+  // --- Debounced drain mechanism ---
+  const changedFiles = new Set();
+  let drainScheduled = false;
+  const DRAIN_DELAY_MS = 50;
+
+  function scheduleDrain() {
+    if (drainScheduled) {
+      return;
+    }
+    drainScheduled = true;
+    setTimeout(flushChanges, DRAIN_DELAY_MS);
+  }
+
+  function flushChanges() {
+    drainScheduled = false;
+    const paths = Array.from(changedFiles);
+    changedFiles.clear();
+
+    for (const filePath of paths) {
+      const state = tracked.get(filePath);
+      if (!state) {
+        continue;
+      }
+      emitLines(filePath, state, root, useColor);
+    }
+  }
+
+  // --- Per-directory watcher ---
+  function watchDirectory(dirPath) {
+    if (dirWatchers.has(dirPath)) {
+      return;
+    }
+
+    let watcher;
+    try {
+      // Non-recursive: watches only this single directory
+      watcher = fs.watch(dirPath, (_eventType, filename) => {
+        if (!filename) {
+          return;
+        }
+
+        const fullPath = path.join(dirPath, filename);
+
+        // Already tracked? Mark changed.
+        if (tracked.has(fullPath)) {
+          changedFiles.add(fullPath);
+          scheduleDrain();
+          return;
+        }
+
+        // New file matching our globs?
+        if (matchesGlob(filename, globRegexes)) {
+          let stats;
+          try {
+            stats = fs.statSync(fullPath);
+          } catch {
+            return;
+          }
+          if (!stats.isFile()) {
+            return;
+          }
+
+          tracked.set(fullPath, {
+            position: 0,
+            inode: stats.ino ?? null,
+            partial: "",
+          });
+
+          const rel = relativeDisplay(root, fullPath);
+          process.stdout.write(
+            `${paint(`[watch] ${rel}`, C_INFO, useColor)}\n`
+          );
+
+          changedFiles.add(fullPath);
+          scheduleDrain();
+        }
+      });
+
+      watcher.on("error", () => {
+        // Directory may have been deleted
+        dirWatchers.delete(dirPath);
+        try {
+          watcher.close();
+        } catch {
+          // ignore
+        }
+      });
+
+      dirWatchers.set(dirPath, watcher);
+    } catch {
+      // Can't watch this directory; will rely on fallback poll
+    }
+  }
+
+  function unwatchDirectory(dirPath) {
+    const watcher = dirWatchers.get(dirPath);
+    if (watcher) {
+      try {
+        watcher.close();
+      } catch {
+        // ignore
+      }
+      dirWatchers.delete(dirPath);
+    }
+  }
+
+  function trackFile(filePath, position) {
     let stats;
     try {
       stats = fs.statSync(filePath);
     } catch {
-      continue;
+      return false;
     }
 
     tracked.set(filePath, {
-      position: stats.size,
+      position: position ?? stats.size,
       inode: stats.ino ?? null,
       partial: "",
     });
+
+    // Ensure the parent directory is watched
+    watchDirectory(path.dirname(filePath));
+    return true;
+  }
+
+  // --- Initial file discovery (async to avoid blocking event loop) ---
+  process.stdout.write(
+    `${paint(`Scanning ${root} ...`, C_INFO, useColor)}\n`
+  );
+
+  await discoverLogFilesAsync(root, globRegexes, (filePath) => {
+    trackFile(filePath, undefined);
 
     if (args.initialLines > 0) {
       const rel = relativeDisplay(root, filePath);
@@ -416,88 +587,81 @@ async function main() {
         process.stdout.write(`${formatOutput(rel, line, useColor)}\n`);
       }
     }
-  }
+  });
 
   const info =
-    `Monitoring ${tracked.size} files under ${root} ` +
-    `(globs: ${globs.join(", ")} | poll=${args.pollInterval}s | scan=${args.scanInterval}s). ` +
+    `Monitoring ${tracked.size} files in ${dirWatchers.size} directories under ${root} ` +
+    `(globs: ${globs.join(", ")}). ` +
     "Press Ctrl+C to stop.";
   process.stdout.write(`${paint(info, C_INFO, useColor)}\n`);
 
-  let stopped = false;
-  const stop = () => {
-    stopped = true;
-  };
-  process.on("SIGINT", stop);
-  process.on("SIGTERM", stop);
+  // --- Fallback poll: stat only the tracked files (not a full tree walk) ---
+  const pollIntervalMs = args.pollInterval * 1000;
+  const scanIntervalMs = args.scanInterval * 1000;
 
-  let lastScan = performance.now() / 1000;
-
-  try {
-    while (!stopped) {
-      const now = performance.now() / 1000;
-      if (now - lastScan >= args.scanInterval) {
-        const currentFiles = discoverLogFiles(root, globRegexes);
-        const trackedFiles = new Set(tracked.keys());
-
-        const newFiles = Array.from(currentFiles)
-          .filter((filePath) => !trackedFiles.has(filePath))
-          .sort();
-
-        for (const newPath of newFiles) {
-          let stats;
-          try {
-            stats = fs.statSync(newPath);
-          } catch {
-            continue;
-          }
-
-          tracked.set(newPath, {
-            position: 0,
-            inode: stats.ino ?? null,
-            partial: "",
-          });
-
-          const rel = relativeDisplay(root, newPath);
-          process.stdout.write(`${paint(`[watch] ${rel}`, C_INFO, useColor)}\n`);
-        }
-
-        for (const filePath of trackedFiles) {
-          if (!currentFiles.has(filePath)) {
-            tracked.delete(filePath);
-          }
-        }
-
-        lastScan = now;
-      }
-
-      const trackedPaths = Array.from(tracked.keys()).sort();
-      for (const filePath of trackedPaths) {
-        const state = tracked.get(filePath);
-        if (!state) {
-          continue;
-        }
-
-        const lines = drainNewLines(filePath, state);
-        if (lines.length === 0) {
-          continue;
-        }
-
-        const rel = relativeDisplay(root, filePath);
-        for (const line of lines) {
-          process.stdout.write(`${formatOutput(rel, line, useColor)}\n`);
-        }
-      }
-
-      if (stopped) {
-        break;
-      }
-      await sleep(args.pollInterval * 1000);
+  function pollTrackedFiles() {
+    for (const [filePath, state] of tracked) {
+      emitLines(filePath, state, root, useColor);
     }
-  } finally {
-    process.off("SIGINT", stop);
-    process.off("SIGTERM", stop);
   }
+
+  // Full scan: rediscover files (handles new directories, removed files)
+  function fullScan() {
+    const currentFiles = discoverLogFilesSync(root, globRegexes);
+    const prevTracked = new Set(tracked.keys());
+
+    for (const filePath of currentFiles) {
+      if (!prevTracked.has(filePath)) {
+        trackFile(filePath, 0);
+        const rel = relativeDisplay(root, filePath);
+        process.stdout.write(
+          `${paint(`[watch] ${rel}`, C_INFO, useColor)}\n`
+        );
+      }
+    }
+
+    // Remove files that no longer exist
+    for (const filePath of prevTracked) {
+      if (!currentFiles.has(filePath)) {
+        tracked.delete(filePath);
+      }
+    }
+
+    // Clean up watchers for directories with no tracked files
+    const activeDirs = new Set();
+    for (const filePath of tracked.keys()) {
+      activeDirs.add(path.dirname(filePath));
+    }
+    for (const dirPath of dirWatchers.keys()) {
+      if (!activeDirs.has(dirPath)) {
+        unwatchDirectory(dirPath);
+      }
+    }
+  }
+
+  const pollTimer = setInterval(pollTrackedFiles, pollIntervalMs);
+  const scanTimer = setInterval(fullScan, scanIntervalMs);
+
+  // --- Wait for shutdown signal ---
+  await new Promise((resolve) => {
+    const stop = () => {
+      resolve();
+    };
+    process.once("SIGINT", stop);
+    process.once("SIGTERM", stop);
+  });
+
+  // --- Cleanup ---
+  clearInterval(pollTimer);
+  clearInterval(scanTimer);
+  for (const watcher of dirWatchers.values()) {
+    try {
+      watcher.close();
+    } catch {
+      // ignore
+    }
+  }
+  dirWatchers.clear();
 
   process.stdout.write(`${paint("Stopping mega-tail.", C_INFO, useColor)}\n`);
   return 0;
