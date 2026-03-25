@@ -7,7 +7,6 @@ const path = require("node:path");
 
 const DEFAULT_GLOBS = ["*.log", "*.log.*"];
 const DEFAULT_POLL_INTERVAL = 5.0;
-const DEFAULT_SCAN_INTERVAL = 30.0;
 
 const C_RESET = "\u001b[0m";
 const C_TIMESTAMP = "\u001b[38;5;81m";
@@ -25,7 +24,6 @@ function usage() {
     "Options:",
     "  --glob <pattern>           Add include glob (repeatable).",
     `  --poll-interval <seconds>  Fallback poll interval (default: ${DEFAULT_POLL_INTERVAL}).`,
-    `  --scan-interval <seconds>  Fallback full-scan interval (default: ${DEFAULT_SCAN_INTERVAL}).`,
     "  -n, --initial-lines <N>    Show last N lines on startup (default: 0).",
     "  --color auto|always|never  Color mode (default: auto).",
     "  -h, --help                 Show help.",
@@ -42,7 +40,6 @@ function parseArgs(argv) {
     directory: null,
     globs: [],
     pollInterval: DEFAULT_POLL_INTERVAL,
-    scanInterval: DEFAULT_SCAN_INTERVAL,
     initialLines: 0,
     color: "auto",
     help: false,
@@ -72,16 +69,6 @@ function parseArgs(argv) {
         throw new Error("Error: --poll-interval requires a numeric value");
       }
       args.pollInterval = value;
-      i += 1;
-      continue;
-    }
-
-    if (token === "--scan-interval") {
-      const value = Number(argv[i + 1]);
-      if (!Number.isFinite(value)) {
-        throw new Error("Error: --scan-interval requires a numeric value");
-      }
-      args.scanInterval = value;
       i += 1;
       continue;
     }
@@ -210,38 +197,6 @@ function globToRegex(glob) {
 function matchesGlob(fileName, globRegexes) {
   const lower = fileName.toLowerCase();
   return globRegexes.some((regex) => regex.test(lower));
-}
-
-function discoverLogFilesSync(root, globRegexes) {
-  const matches = new Set();
-  const stack = [root];
-
-  while (stack.length > 0) {
-    const current = stack.pop();
-    let entries;
-    try {
-      entries = fs.readdirSync(current, { withFileTypes: true });
-    } catch {
-      continue;
-    }
-
-    for (const entry of entries) {
-      const full = path.join(current, entry.name);
-      if (entry.isDirectory()) {
-        stack.push(full);
-        continue;
-      }
-      if (!entry.isFile()) {
-        continue;
-      }
-
-      if (matchesGlob(entry.name, globRegexes)) {
-        matches.add(full);
-      }
-    }
-  }
-
-  return matches;
 }
 
 // Async directory walk that yields to the event loop every BATCH_SIZE
@@ -424,8 +379,8 @@ async function main() {
     return 1;
   }
 
-  if (args.pollInterval <= 0 || args.scanInterval <= 0) {
-    fail("Error: poll and scan intervals must be positive");
+  if (args.pollInterval <= 0) {
+    fail("Error: poll interval must be positive");
     return 1;
   }
 
@@ -542,18 +497,6 @@ async function main() {
     }
   }
 
-  function unwatchDirectory(dirPath) {
-    const watcher = dirWatchers.get(dirPath);
-    if (watcher) {
-      try {
-        watcher.close();
-      } catch {
-        // ignore
-      }
-      dirWatchers.delete(dirPath);
-    }
-  }
-
   function trackFile(filePath, position) {
     let stats;
     try {
@@ -595,9 +538,8 @@ async function main() {
     "Press Ctrl+C to stop.";
   process.stdout.write(`${paint(info, C_INFO, useColor)}\n`);
 
-  // --- Fallback poll: stat only the tracked files (not a full tree walk) ---
+  // --- Fallback poll: stat only the tracked files (no full tree walk) ---
   const pollIntervalMs = args.pollInterval * 1000;
-  const scanIntervalMs = args.scanInterval * 1000;
 
   function pollTrackedFiles() {
     for (const [filePath, state] of tracked) {
@@ -605,42 +547,7 @@ async function main() {
     }
   }
 
-  // Full scan: rediscover files (handles new directories, removed files)
-  function fullScan() {
-    const currentFiles = discoverLogFilesSync(root, globRegexes);
-    const prevTracked = new Set(tracked.keys());
-
-    for (const filePath of currentFiles) {
-      if (!prevTracked.has(filePath)) {
-        trackFile(filePath, 0);
-        const rel = relativeDisplay(root, filePath);
-        process.stdout.write(
-          `${paint(`[watch] ${rel}`, C_INFO, useColor)}\n`
-        );
-      }
-    }
-
-    // Remove files that no longer exist
-    for (const filePath of prevTracked) {
-      if (!currentFiles.has(filePath)) {
-        tracked.delete(filePath);
-      }
-    }
-
-    // Clean up watchers for directories with no tracked files
-    const activeDirs = new Set();
-    for (const filePath of tracked.keys()) {
-      activeDirs.add(path.dirname(filePath));
-    }
-    for (const dirPath of dirWatchers.keys()) {
-      if (!activeDirs.has(dirPath)) {
-        unwatchDirectory(dirPath);
-      }
-    }
-  }
-
   const pollTimer = setInterval(pollTrackedFiles, pollIntervalMs);
-  const scanTimer = setInterval(fullScan, scanIntervalMs);
 
   // --- Wait for shutdown signal ---
   await new Promise((resolve) => {
@@ -653,7 +560,6 @@ async function main() {
 
   // --- Cleanup ---
   clearInterval(pollTimer);
-  clearInterval(scanTimer);
   for (const watcher of dirWatchers.values()) {
     try {
       watcher.close();
