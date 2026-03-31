@@ -430,7 +430,7 @@ async function main() {
     }
   }
 
-  // --- Per-directory watcher ---
+  // --- Per-directory watcher (for directories containing log files) ---
   function watchDirectory(dirPath) {
     if (dirWatchers.has(dirPath)) {
       return;
@@ -438,7 +438,6 @@ async function main() {
 
     let watcher;
     try {
-      // Non-recursive: watches only this single directory
       watcher = fs.watch(dirPath, (_eventType, filename) => {
         if (!filename) {
           return;
@@ -482,7 +481,6 @@ async function main() {
       });
 
       watcher.on("error", () => {
-        // Directory may have been deleted
         dirWatchers.delete(dirPath);
         try {
           watcher.close();
@@ -514,6 +512,72 @@ async function main() {
     // Ensure the parent directory is watched
     watchDirectory(path.dirname(filePath));
     return true;
+  }
+
+  // --- Recursive watcher on root for new subdirectory/file discovery ---
+  // On macOS, fs.watch({ recursive: true }) uses FSEvents which is a single
+  // kernel subscription — efficient even for large trees. We filter events
+  // early: only react to filenames matching our globs (cheap string check).
+  let rootWatcher = null;
+  try {
+    rootWatcher = fs.watch(root, { recursive: true }, (_eventType, filename) => {
+      if (!filename) {
+        return;
+      }
+
+      const basename = path.basename(filename);
+      const fullPath = path.join(root, filename);
+
+      // Already tracked file? Mark changed.
+      if (tracked.has(fullPath)) {
+        changedFiles.add(fullPath);
+        scheduleDrain();
+        return;
+      }
+
+      // Only do a stat call for filenames that match our globs.
+      // This avoids statSync on the millions of non-log files.
+      if (!matchesGlob(basename, globRegexes)) {
+        return;
+      }
+
+      let stats;
+      try {
+        stats = fs.statSync(fullPath);
+      } catch {
+        return;
+      }
+      if (!stats.isFile()) {
+        return;
+      }
+
+      // New log file discovered — track it and set up a directory watcher
+      tracked.set(fullPath, {
+        position: 0,
+        inode: stats.ino ?? null,
+        partial: "",
+      });
+      watchDirectory(path.dirname(fullPath));
+
+      const rel = relativeDisplay(root, fullPath);
+      process.stdout.write(
+        `${paint(`[watch] ${rel}`, C_INFO, useColor)}\n`
+      );
+
+      changedFiles.add(fullPath);
+      scheduleDrain();
+    });
+
+    rootWatcher.on("error", () => {
+      // Recursive watch not working; fall back to poll-only
+      if (rootWatcher) {
+        rootWatcher.close();
+        rootWatcher = null;
+      }
+    });
+  } catch {
+    // Recursive watch not supported on this platform
+    rootWatcher = null;
   }
 
   // --- Initial file discovery (async to avoid blocking event loop) ---
@@ -560,6 +624,9 @@ async function main() {
 
   // --- Cleanup ---
   clearInterval(pollTimer);
+  if (rootWatcher) {
+    rootWatcher.close();
+  }
   for (const watcher of dirWatchers.values()) {
     try {
       watcher.close();
