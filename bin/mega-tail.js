@@ -26,6 +26,7 @@ function usage() {
     `  --poll-interval <seconds>  Fallback poll interval (default: ${DEFAULT_POLL_INTERVAL}).`,
     "  -n, --initial-lines <N>    Show last N lines on startup (default: 0).",
     "  --color auto|always|never  Color mode (default: auto).",
+    "  --json                     Output structured NDJSON instead of colored text.",
     "  -h, --help                 Show help.",
   ].join("\n");
 }
@@ -42,6 +43,7 @@ function parseArgs(argv) {
     pollInterval: DEFAULT_POLL_INTERVAL,
     initialLines: 0,
     color: "auto",
+    json: false,
     help: false,
   };
 
@@ -81,6 +83,11 @@ function parseArgs(argv) {
       }
       args.initialLines = value;
       i += 1;
+      continue;
+    }
+
+    if (token === "--json") {
+      args.json = true;
       continue;
     }
 
@@ -272,6 +279,18 @@ function formatOutput(relPath, line, useColor) {
   return `${fileBlock} ${tsBlock} ${content}`;
 }
 
+function jsonLine(relPath, line) {
+  return JSON.stringify({ file: relPath, timestamp: detectionTimestamp(), content: line });
+}
+
+function jsonInfo(message) {
+  return JSON.stringify({ type: "info", message });
+}
+
+function jsonStatus(obj) {
+  return JSON.stringify({ type: "status", ...obj });
+}
+
 function drainNewLines(filePath, state) {
   let stats;
   try {
@@ -346,14 +365,18 @@ function expandHome(inputPath) {
   return inputPath;
 }
 
-function emitLines(filePath, state, root, useColor) {
+function emitLines(filePath, state, root, useColor, jsonMode) {
   const lines = drainNewLines(filePath, state);
   if (lines.length === 0) {
     return;
   }
   const rel = relativeDisplay(root, filePath);
   for (const line of lines) {
-    process.stdout.write(`${formatOutput(rel, line, useColor)}\n`);
+    process.stdout.write(
+      jsonMode
+        ? `${jsonLine(rel, line)}\n`
+        : `${formatOutput(rel, line, useColor)}\n`
+    );
   }
 }
 
@@ -394,7 +417,8 @@ async function main() {
     return 1;
   }
 
-  const useColor = colorEnabled(args.color);
+  const jsonMode = args.json;
+  const useColor = jsonMode ? false : colorEnabled(args.color);
   const globs = args.globs.length > 0 ? args.globs : DEFAULT_GLOBS;
   const globRegexes = globs.map((glob) => globToRegex(glob.toLowerCase()));
 
@@ -426,7 +450,7 @@ async function main() {
       if (!state) {
         continue;
       }
-      emitLines(filePath, state, root, useColor);
+      emitLines(filePath, state, root, useColor, jsonMode);
     }
   }
 
@@ -472,7 +496,9 @@ async function main() {
 
           const rel = relativeDisplay(root, fullPath);
           process.stdout.write(
-            `${paint(`[watch] ${rel}`, C_INFO, useColor)}\n`
+            jsonMode
+              ? `${jsonInfo(`[watch] ${rel}`)}\n`
+              : `${paint(`[watch] ${rel}`, C_INFO, useColor)}\n`
           );
 
           changedFiles.add(fullPath);
@@ -561,7 +587,9 @@ async function main() {
 
       const rel = relativeDisplay(root, fullPath);
       process.stdout.write(
-        `${paint(`[watch] ${rel}`, C_INFO, useColor)}\n`
+        jsonMode
+          ? `${jsonInfo(`[watch] ${rel}`)}\n`
+          : `${paint(`[watch] ${rel}`, C_INFO, useColor)}\n`
       );
 
       changedFiles.add(fullPath);
@@ -582,7 +610,9 @@ async function main() {
 
   // --- Initial file discovery (async to avoid blocking event loop) ---
   process.stdout.write(
-    `${paint(`Scanning ${root} ...`, C_INFO, useColor)}\n`
+    jsonMode
+      ? `${jsonInfo(`Scanning ${root} ...`)}\n`
+      : `${paint(`Scanning ${root} ...`, C_INFO, useColor)}\n`
   );
 
   await discoverLogFilesAsync(root, globRegexes, (filePath) => {
@@ -591,23 +621,33 @@ async function main() {
     if (args.initialLines > 0) {
       const rel = relativeDisplay(root, filePath);
       for (const line of readLastLines(filePath, args.initialLines)) {
-        process.stdout.write(`${formatOutput(rel, line, useColor)}\n`);
+        process.stdout.write(
+          jsonMode
+            ? `${jsonLine(rel, line)}\n`
+            : `${formatOutput(rel, line, useColor)}\n`
+        );
       }
     }
   });
 
-  const info =
-    `Monitoring ${tracked.size} files in ${dirWatchers.size} directories under ${root} ` +
-    `(globs: ${globs.join(", ")}). ` +
-    "Press Ctrl+C to stop.";
-  process.stdout.write(`${paint(info, C_INFO, useColor)}\n`);
+  if (jsonMode) {
+    process.stdout.write(
+      `${jsonStatus({ files: tracked.size, directories: dirWatchers.size, root, globs })}\n`
+    );
+  } else {
+    const info =
+      `Monitoring ${tracked.size} files in ${dirWatchers.size} directories under ${root} ` +
+      `(globs: ${globs.join(", ")}). ` +
+      "Press Ctrl+C to stop.";
+    process.stdout.write(`${paint(info, C_INFO, useColor)}\n`);
+  }
 
   // --- Fallback poll: stat only the tracked files (no full tree walk) ---
   const pollIntervalMs = args.pollInterval * 1000;
 
   function pollTrackedFiles() {
     for (const [filePath, state] of tracked) {
-      emitLines(filePath, state, root, useColor);
+      emitLines(filePath, state, root, useColor, jsonMode);
     }
   }
 
@@ -636,7 +676,11 @@ async function main() {
   }
   dirWatchers.clear();
 
-  process.stdout.write(`${paint("Stopping mega-tail.", C_INFO, useColor)}\n`);
+  process.stdout.write(
+    jsonMode
+      ? `${jsonInfo("Stopping mega-tail.")}\n`
+      : `${paint("Stopping mega-tail.", C_INFO, useColor)}\n`
+  );
   return 0;
 }
 
