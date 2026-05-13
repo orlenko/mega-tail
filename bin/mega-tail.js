@@ -19,7 +19,7 @@ function usage() {
     "mega-tail - Tail dynamic log files in a directory tree.",
     "",
     "Usage:",
-    "  mega-tail <directory> [options]",
+    "  mega-tail <directory> [<directory> ...] [options]",
     "",
     "Options:",
     "  --glob <pattern>           Add include glob (repeatable).",
@@ -28,6 +28,10 @@ function usage() {
     "  --color auto|always|never  Color mode (default: auto).",
     "  --json                     Output structured NDJSON instead of colored text.",
     "  -h, --help                 Show help.",
+    "",
+    "When multiple directories are passed, each is watched recursively in parallel.",
+    "Output paths are rendered relative to whichever supplied root contains the",
+    "file (longest match wins when roots overlap).",
   ].join("\n");
 }
 
@@ -38,7 +42,7 @@ function fail(message) {
 
 function parseArgs(argv) {
   const args = {
-    directory: null,
+    directories: [],
     globs: [],
     pollInterval: DEFAULT_POLL_INTERVAL,
     initialLines: 0,
@@ -105,14 +109,11 @@ function parseArgs(argv) {
       throw new Error(`Error: unknown option: ${token}`);
     }
 
-    if (args.directory !== null) {
-      throw new Error("Error: only one directory argument is allowed");
-    }
-    args.directory = token;
+    args.directories.push(token);
   }
 
-  if (!args.help && args.directory === null) {
-    throw new Error("Error: directory is required");
+  if (!args.help && args.directories.length === 0) {
+    throw new Error("Error: at least one directory is required");
   }
 
   return args;
@@ -239,7 +240,6 @@ async function discoverLogFilesAsync(root, globRegexes, onFound) {
 
     processed += 1;
     if (processed % BATCH_SIZE === 0) {
-      // Yield to event loop so watchers and signals can fire
       await new Promise((resolve) => setImmediate(resolve));
     }
   }
@@ -264,12 +264,16 @@ function readLastLines(filePath, count) {
   return lines.slice(-count);
 }
 
-function relativeDisplay(root, filePath) {
-  const rel = path.relative(root, filePath);
-  if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) {
-    return filePath;
+// `roots` must be pre-sorted longest-first so nested overlapping roots
+// resolve to the most specific prefix in display paths.
+function relativeDisplay(roots, filePath) {
+  for (const root of roots) {
+    const rel = path.relative(root, filePath);
+    if (rel && !rel.startsWith("..") && !path.isAbsolute(rel)) {
+      return rel.split(path.sep).join("/");
+    }
   }
-  return rel.split(path.sep).join("/");
+  return filePath;
 }
 
 function formatOutput(relPath, line, useColor) {
@@ -365,12 +369,12 @@ function expandHome(inputPath) {
   return inputPath;
 }
 
-function emitLines(filePath, state, root, useColor, jsonMode) {
+function emitLines(filePath, state, displayRoots, useColor, jsonMode) {
   const lines = drainNewLines(filePath, state);
   if (lines.length === 0) {
     return;
   }
-  const rel = relativeDisplay(root, filePath);
+  const rel = relativeDisplay(displayRoots, filePath);
   for (const line of lines) {
     process.stdout.write(
       jsonMode
@@ -396,11 +400,30 @@ async function main() {
     return 0;
   }
 
-  const root = path.resolve(expandHome(args.directory));
-  if (!fs.existsSync(root) || !fs.statSync(root).isDirectory()) {
-    fail(`Error: not a directory: ${root}`);
-    return 1;
+  // Resolve and validate every supplied directory; dedupe while preserving
+  // first-seen order for display lines.
+  const seenRoots = new Set();
+  const roots = [];
+  for (const raw of args.directories) {
+    const resolved = path.resolve(expandHome(raw));
+    let stats;
+    try {
+      stats = fs.statSync(resolved);
+    } catch {
+      fail(`Error: not a directory: ${resolved}`);
+      return 1;
+    }
+    if (!stats.isDirectory()) {
+      fail(`Error: not a directory: ${resolved}`);
+      return 1;
+    }
+    if (!seenRoots.has(resolved)) {
+      seenRoots.add(resolved);
+      roots.push(resolved);
+    }
   }
+  // Longest-first lookup table for relative-path rendering.
+  const displayRoots = [...roots].sort((a, b) => b.length - a.length);
 
   if (args.pollInterval <= 0) {
     fail("Error: poll interval must be positive");
@@ -421,6 +444,8 @@ async function main() {
   const useColor = jsonMode ? false : colorEnabled(args.color);
   const globs = args.globs.length > 0 ? args.globs : DEFAULT_GLOBS;
   const globRegexes = globs.map((glob) => globToRegex(glob.toLowerCase()));
+
+  const rootsLabel = roots.length === 1 ? roots[0] : roots.join(", ");
 
   // tracked: filePath -> { position, inode, partial }
   const tracked = new Map();
@@ -450,7 +475,7 @@ async function main() {
       if (!state) {
         continue;
       }
-      emitLines(filePath, state, root, useColor, jsonMode);
+      emitLines(filePath, state, displayRoots, useColor, jsonMode);
     }
   }
 
@@ -469,14 +494,12 @@ async function main() {
 
         const fullPath = path.join(dirPath, filename);
 
-        // Already tracked? Mark changed.
         if (tracked.has(fullPath)) {
           changedFiles.add(fullPath);
           scheduleDrain();
           return;
         }
 
-        // New file matching our globs?
         if (matchesGlob(filename, globRegexes)) {
           let stats;
           try {
@@ -494,7 +517,7 @@ async function main() {
             partial: "",
           });
 
-          const rel = relativeDisplay(root, fullPath);
+          const rel = relativeDisplay(displayRoots, fullPath);
           process.stdout.write(
             jsonMode
               ? `${jsonInfo(`[watch] ${rel}`)}\n`
@@ -535,108 +558,123 @@ async function main() {
       partial: "",
     });
 
-    // Ensure the parent directory is watched
     watchDirectory(path.dirname(filePath));
     return true;
   }
 
-  // --- Recursive watcher on root for new subdirectory/file discovery ---
-  // On macOS, fs.watch({ recursive: true }) uses FSEvents which is a single
-  // kernel subscription — efficient even for large trees. We filter events
-  // early: only react to filenames matching our globs (cheap string check).
-  let rootWatcher = null;
-  try {
-    rootWatcher = fs.watch(root, { recursive: true }, (_eventType, filename) => {
-      if (!filename) {
-        return;
-      }
+  // --- Recursive watcher(s): one per supplied root. On macOS each call is
+  // a single FSEvents subscription, efficient even for large trees. Overlapping
+  // roots can fire events twice; `tracked.has()` and `dirWatchers.has()` make
+  // the second fire a no-op.
+  const rootWatchers = [];
+  for (const root of roots) {
+    let watcher = null;
+    try {
+      watcher = fs.watch(root, { recursive: true }, (_eventType, filename) => {
+        if (!filename) {
+          return;
+        }
 
-      const basename = path.basename(filename);
-      const fullPath = path.join(root, filename);
+        const basename = path.basename(filename);
+        const fullPath = path.join(root, filename);
 
-      // Already tracked file? Mark changed.
-      if (tracked.has(fullPath)) {
+        if (tracked.has(fullPath)) {
+          changedFiles.add(fullPath);
+          scheduleDrain();
+          return;
+        }
+
+        if (!matchesGlob(basename, globRegexes)) {
+          return;
+        }
+
+        let stats;
+        try {
+          stats = fs.statSync(fullPath);
+        } catch {
+          return;
+        }
+        if (!stats.isFile()) {
+          return;
+        }
+
+        tracked.set(fullPath, {
+          position: 0,
+          inode: stats.ino ?? null,
+          partial: "",
+        });
+        watchDirectory(path.dirname(fullPath));
+
+        const rel = relativeDisplay(displayRoots, fullPath);
+        process.stdout.write(
+          jsonMode
+            ? `${jsonInfo(`[watch] ${rel}`)}\n`
+            : `${paint(`[watch] ${rel}`, C_INFO, useColor)}\n`
+        );
+
         changedFiles.add(fullPath);
         scheduleDrain();
-        return;
-      }
-
-      // Only do a stat call for filenames that match our globs.
-      // This avoids statSync on the millions of non-log files.
-      if (!matchesGlob(basename, globRegexes)) {
-        return;
-      }
-
-      let stats;
-      try {
-        stats = fs.statSync(fullPath);
-      } catch {
-        return;
-      }
-      if (!stats.isFile()) {
-        return;
-      }
-
-      // New log file discovered — track it and set up a directory watcher
-      tracked.set(fullPath, {
-        position: 0,
-        inode: stats.ino ?? null,
-        partial: "",
       });
-      watchDirectory(path.dirname(fullPath));
 
-      const rel = relativeDisplay(root, fullPath);
-      process.stdout.write(
-        jsonMode
-          ? `${jsonInfo(`[watch] ${rel}`)}\n`
-          : `${paint(`[watch] ${rel}`, C_INFO, useColor)}\n`
-      );
+      const captured = watcher;
+      watcher.on("error", () => {
+        const idx = rootWatchers.indexOf(captured);
+        if (idx >= 0) {
+          rootWatchers.splice(idx, 1);
+        }
+        try {
+          captured.close();
+        } catch {
+          // ignore
+        }
+      });
 
-      changedFiles.add(fullPath);
-      scheduleDrain();
-    });
-
-    rootWatcher.on("error", () => {
-      // Recursive watch not working; fall back to poll-only
-      if (rootWatcher) {
-        rootWatcher.close();
-        rootWatcher = null;
-      }
-    });
-  } catch {
-    // Recursive watch not supported on this platform
-    rootWatcher = null;
+      rootWatchers.push(watcher);
+    } catch {
+      // Recursive watch not supported for this root; rely on fallback poll.
+    }
   }
 
   // --- Initial file discovery (async to avoid blocking event loop) ---
   process.stdout.write(
     jsonMode
-      ? `${jsonInfo(`Scanning ${root} ...`)}\n`
-      : `${paint(`Scanning ${root} ...`, C_INFO, useColor)}\n`
+      ? `${jsonInfo(`Scanning ${rootsLabel} ...`)}\n`
+      : `${paint(`Scanning ${rootsLabel} ...`, C_INFO, useColor)}\n`
   );
 
-  await discoverLogFilesAsync(root, globRegexes, (filePath) => {
-    trackFile(filePath, undefined);
-
-    if (args.initialLines > 0) {
-      const rel = relativeDisplay(root, filePath);
-      for (const line of readLastLines(filePath, args.initialLines)) {
-        process.stdout.write(
-          jsonMode
-            ? `${jsonLine(rel, line)}\n`
-            : `${formatOutput(rel, line, useColor)}\n`
-        );
+  for (const root of roots) {
+    await discoverLogFilesAsync(root, globRegexes, (filePath) => {
+      if (tracked.has(filePath)) {
+        // Already discovered via an overlapping root walk.
+        return;
       }
-    }
-  });
+      trackFile(filePath, undefined);
+
+      if (args.initialLines > 0) {
+        const rel = relativeDisplay(displayRoots, filePath);
+        for (const line of readLastLines(filePath, args.initialLines)) {
+          process.stdout.write(
+            jsonMode
+              ? `${jsonLine(rel, line)}\n`
+              : `${formatOutput(rel, line, useColor)}\n`
+          );
+        }
+      }
+    });
+  }
 
   if (jsonMode) {
-    process.stdout.write(
-      `${jsonStatus({ files: tracked.size, directories: dirWatchers.size, root, globs })}\n`
-    );
+    // Single-root status keeps the original {root: "..."} shape byte-for-byte;
+    // multi-root emits {roots: [...]}. Consumers that only ever pass one path
+    // see no schema change.
+    const statusBody =
+      roots.length === 1
+        ? { files: tracked.size, directories: dirWatchers.size, root: roots[0], globs }
+        : { files: tracked.size, directories: dirWatchers.size, roots, globs };
+    process.stdout.write(`${jsonStatus(statusBody)}\n`);
   } else {
     const info =
-      `Monitoring ${tracked.size} files in ${dirWatchers.size} directories under ${root} ` +
+      `Monitoring ${tracked.size} files in ${dirWatchers.size} directories under ${rootsLabel} ` +
       `(globs: ${globs.join(", ")}). ` +
       "Press Ctrl+C to stop.";
     process.stdout.write(`${paint(info, C_INFO, useColor)}\n`);
@@ -647,7 +685,7 @@ async function main() {
 
   function pollTrackedFiles() {
     for (const [filePath, state] of tracked) {
-      emitLines(filePath, state, root, useColor, jsonMode);
+      emitLines(filePath, state, displayRoots, useColor, jsonMode);
     }
   }
 
@@ -664,9 +702,14 @@ async function main() {
 
   // --- Cleanup ---
   clearInterval(pollTimer);
-  if (rootWatcher) {
-    rootWatcher.close();
+  for (const w of rootWatchers) {
+    try {
+      w.close();
+    } catch {
+      // ignore
+    }
   }
+  rootWatchers.length = 0;
   for (const watcher of dirWatchers.values()) {
     try {
       watcher.close();

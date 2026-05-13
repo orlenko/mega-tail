@@ -6,7 +6,7 @@ Tail dynamic logs in a directory tree.
 
 ## Features
 
-- Recursive discovery under a root directory
+- Recursive discovery under one or more root directories
 - Live follow of existing files
 - Auto-discovery of new files
 - Per-line prefix with source file path and detection timestamp
@@ -20,6 +20,14 @@ Run via `npx` (no prior install needed):
 npx mega-tail /var/log/myapp
 ```
 
+Watch multiple directories in a single unified stream:
+
+```bash
+npx mega-tail /var/log/myapp /var/log/myapp-feeder
+```
+
+Each `[<relpath>]` prefix is rendered relative to whichever supplied root contains the file. If two roots overlap (e.g. `/a` and `/a/b`), the longer (more specific) root wins so the prefix is unambiguous. Single-path invocations are byte-identical to prior versions.
+
 Run local Python script:
 
 ```bash
@@ -29,7 +37,7 @@ Run local Python script:
 Run local Node script:
 
 ```bash
-node bin/mega-tail.js <directory>
+node bin/mega-tail.js <directory> [<directory> ...]
 ```
 
 Examples:
@@ -38,6 +46,7 @@ Examples:
 ./mega-tail /var/log/myapp
 node bin/mega-tail.js /var/log/myapp
 npx mega-tail /var/log/myapp
+npx mega-tail /var/log/myapp /var/log/myapp-feeder
 ```
 
 Sample output:
